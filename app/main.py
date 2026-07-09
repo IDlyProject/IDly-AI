@@ -1,15 +1,50 @@
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy.orm import Session
+import uuid
+from pathlib import Path
 
-from .db import Base, engine, get_db
-from .schemas import CreateJobRequest, CreateJobResponse, JobResultResponse, JobStatusResponse
-from .service import create_job, get_job
+from fastapi import FastAPI, File, HTTPException, UploadFile
 
-app = FastAPI(title="Mail Analysis API", version="0.1.0")
+from analysis_pipeline import run_analysis
 
-Base.metadata.create_all(bind=engine)
+from .db import BASE_DIR
+from .schemas import (
+    AnalyzeMboxResponse,
+)
+
+app = FastAPI(title="Mail Analysis API", version="0.2.0")
+DEFAULT_ANALYSIS_KEYWORDS = ["보안"]
+
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def save_uploaded_mbox(file: UploadFile) -> tuple[str, Path, int]:
+    original_name = Path(file.filename or "").name
+    if not original_name or not original_name.lower().endswith(".mbox"):
+        raise HTTPException(status_code=400, detail="Only .mbox files are allowed")
+
+    safe_stem = Path(original_name).stem.replace(" ", "_")
+    stored_name = f"{safe_stem}_{uuid.uuid4().hex}.mbox"
+    destination = UPLOAD_DIR / stored_name
+
+    total_size = 0
+    try:
+        with destination.open("wb") as handle:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                handle.write(chunk)
+    except Exception as exc:
+        if destination.exists():
+            destination.unlink()
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file") from exc
+    finally:
+        await file.close()
+
+    return original_name, destination, total_size
 
 
 @app.get("/health")
@@ -17,40 +52,16 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/jobs", response_model=CreateJobResponse)
-def create_analysis_job(payload: CreateJobRequest, db: Session = Depends(get_db)) -> CreateJobResponse:
-    job = create_job(db=db, mbox_path=payload.mbox_path, keywords=payload.keywords)
-    return CreateJobResponse(job_id=job.id, status=job.status)
+@app.post("/analyze", response_model=AnalyzeMboxResponse)
+async def analyze_mbox(file: UploadFile = File(...)) -> AnalyzeMboxResponse:
+    _, destination, _ = await save_uploaded_mbox(file)
 
+    try:
+        result = run_analysis(mbox_path=destination, keywords=DEFAULT_ANALYSIS_KEYWORDS)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
+    finally:
+        if destination.exists():
+            destination.unlink()
 
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
-def get_analysis_job(job_id: str, db: Session = Depends(get_db)) -> JobStatusResponse:
-    job = get_job(db=db, job_id=job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return JobStatusResponse(
-        id=job.id,
-        status=job.status,
-        progress=job.progress,
-        mbox_path=job.mbox_path,
-        request_keywords=job.request_keywords,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        started_at=job.started_at,
-        finished_at=job.finished_at,
-        updated_at=job.updated_at,
-    )
-
-
-@app.get("/jobs/{job_id}/result", response_model=JobResultResponse)
-def get_analysis_result(job_id: str, db: Session = Depends(get_db)) -> JobResultResponse:
-    job = get_job(db=db, job_id=job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return JobResultResponse(
-        id=job.id,
-        status=job.status,
-        result=job.result_json,
-    )
+    return AnalyzeMboxResponse(accounts=result.get("accounts", []))

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import mailbox
-import random
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -23,11 +23,6 @@ try:
     import hdbscan
 except Exception:  # pragma: no cover
     hdbscan = None
-
-try:
-    from bertopic import BERTopic
-except Exception:  # pragma: no cover
-    BERTopic = None
 
 
 DEFAULT_STOPWORDS = {
@@ -139,6 +134,8 @@ class AnalysisConfig:
     hdbscan_min_samples: int = 5
     isolation_contamination: float = 0.08
     random_state: int = 42
+    enable_clustering: bool = False
+    enable_bertopic: bool = False
 
 
 class VisibleTextParser(HTMLParser):
@@ -326,41 +323,50 @@ def preprocess_records(
 def build_tfidf(
     preprocessed_records: list[dict[str, Any]],
     config: AnalysisConfig,
+    include_mail: bool = False,
+    include_sender: bool = True,
 ) -> dict[str, Any]:
     if not preprocessed_records:
         raise ValueError("No preprocessed records available.")
 
-    mail_documents = [
-        " ".join(row["tokens"]) if row["tokens"] else row["clean_text"]
-        for row in preprocessed_records
-    ]
+    mail_tfidf_matrix = None
+    mail_feature_names = None
+    if include_mail:
+        mail_documents = [
+            " ".join(row["tokens"]) if row["tokens"] else row["clean_text"]
+            for row in preprocessed_records
+        ]
 
-    mail_vectorizer = TfidfVectorizer(
-        max_features=config.mail_tfidf_max_features,
-        min_df=config.min_df_mail,
-        max_df=config.max_df_mail,
-        ngram_range=config.ngram_range,
-    )
-    mail_tfidf_matrix = mail_vectorizer.fit_transform(mail_documents)
-    mail_feature_names = mail_vectorizer.get_feature_names_out()
+        mail_vectorizer = TfidfVectorizer(
+            max_features=config.mail_tfidf_max_features,
+            min_df=config.min_df_mail,
+            max_df=config.max_df_mail,
+            ngram_range=config.ngram_range,
+        )
+        mail_tfidf_matrix = mail_vectorizer.fit_transform(mail_documents)
+        mail_feature_names = mail_vectorizer.get_feature_names_out()
 
-    sender_documents: dict[str, list[str]] = {}
-    for row in preprocessed_records:
-        sender_key = row.get("sender_email") or row.get("sender") or "unknown_sender"
-        sender_documents.setdefault(sender_key, [])
-        sender_documents[sender_key].append(" ".join(row["tokens"]))
+    sender_tfidf_matrix = None
+    sender_feature_names = None
+    sender_ids: list[str] = []
+    if include_sender:
+        sender_documents: dict[str, list[str]] = {}
+        for row in preprocessed_records:
+            sender_key = row.get("sender_email") or row.get("sender") or "unknown_sender"
+            sender_documents.setdefault(sender_key, [])
+            sender_documents[sender_key].append(" ".join(row["tokens"]))
 
-    sender_ids = list(sender_documents.keys())
-    sender_corpus = [" ".join(sender_documents[sender]) for sender in sender_ids]
+        sender_ids = list(sender_documents.keys())
+        sender_corpus = [" ".join(sender_documents[sender]) for sender in sender_ids]
 
-    sender_vectorizer = TfidfVectorizer(
-        max_features=config.sender_tfidf_max_features,
-        min_df=1,
-        max_df=config.max_df_sender,
-        ngram_range=config.ngram_range,
-    )
-    sender_tfidf_matrix = sender_vectorizer.fit_transform(sender_corpus)
-    sender_feature_names = sender_vectorizer.get_feature_names_out()
+        sender_vectorizer = TfidfVectorizer(
+            max_features=config.sender_tfidf_max_features,
+            min_df=1,
+            max_df=config.max_df_sender,
+            ngram_range=config.ngram_range,
+        )
+        sender_tfidf_matrix = sender_vectorizer.fit_transform(sender_corpus)
+        sender_feature_names = sender_vectorizer.get_feature_names_out()
 
     return {
         "mail_tfidf_matrix": mail_tfidf_matrix,
@@ -432,8 +438,15 @@ def topic_and_anomaly(
 ) -> tuple[list[int], pd.DataFrame, pd.DataFrame]:
     topics = [-1] * len(preprocessed_records)
     topic_info = pd.DataFrame(columns=["Topic", "Count", "Name"])
+    BERTopic = None
 
-    if BERTopic is not None and preprocessed_records:
+    if config.enable_bertopic and preprocessed_records:
+        try:
+            from bertopic import BERTopic  # Lazy import for performance.
+        except Exception:
+            BERTopic = None
+
+    if config.enable_bertopic and BERTopic is not None and preprocessed_records:
         topic_docs = [
             row["clean_text"] if row["clean_text"] else " ".join(row["tokens"])
             for row in preprocessed_records
@@ -611,144 +624,55 @@ def score_to_state(score: float) -> str:
     return "양호"
 
 
-def build_random_sender_report(
-    preprocessed_records: list[dict[str, Any]],
+def build_account_summary(
     sender_status_df: pd.DataFrame,
-    sender_profiles: dict[str, list[tuple[str, int]]],
-    months: int = 6,
-) -> dict[str, Any] | None:
+    preprocessed_records: list[dict[str, Any]],
+) -> dict[str, Any]:
     if sender_status_df.empty:
-        return None
+        return {"accounts": []}
 
-    report_df_all = pd.DataFrame(preprocessed_records).copy()
-    report_df_all["sender_key"] = report_df_all["sender_email"].fillna("")
-    report_df_all["sender_key"] = report_df_all["sender_key"].where(
-        report_df_all["sender_key"] != "",
-        report_df_all["sender"],
-    )
+    state_reason_map = {
+        "복구/비밀번호 재설정": "비밀번호 재설정, 계정 복구, 인증 복원 관련 표현이 반복적으로 나타났습니다.",
+        "로그인 이상 탐지": "새 로그인, 인증 코드, 본인 확인, 보안 알림이 함께 관찰되었습니다.",
+        "보안 조치 필요": "경고/조치/검토 요청 표현이 누적되어 후속 확인이 필요한 상태입니다.",
+        "이상 패턴 감지": "메일 패턴이 다른 발신자에 비해 다르게 나타나 추가 확인이 필요합니다.",
+        "로그인/인증 활동": "로그인 및 인증 관련 활동이 중심인 발신자입니다.",
+        "일반 보안 알림": "주로 안내성 보안 알림 메일이 관찰됩니다.",
+    }
 
-    valid_candidates = sender_status_df[sender_status_df["mail_count"] >= 1].copy()
-    if valid_candidates.empty:
-        return None
-
-    selected_sender_key = random.choice(valid_candidates["sender_key"].tolist())
-    sender_report_row = sender_status_df[
-        sender_status_df["sender_key"] == selected_sender_key
-    ].iloc[0]
-
-    report_df = report_df_all[report_df_all["sender_key"] == selected_sender_key].copy()
-    report_df["parsed_date"] = pd.to_datetime(report_df["date"], errors="coerce", utc=True)
-    report_df = report_df.sort_values("parsed_date")
-
-    risk_score_value = float(sender_report_row["risk_score"])
-    risk_state = score_to_state(risk_score_value)
-
-    latest_date = report_df["parsed_date"].max()
-    earliest_date = report_df["parsed_date"].min()
-    if pd.notna(latest_date):
-        cutoff_date = latest_date - pd.DateOffset(months=months)
-    else:
-        cutoff_date = pd.Timestamp.now(tz="UTC") - pd.DateOffset(months=months)
-
-    security_terms = [
-        "보안",
-        "security",
-        "로그인",
-        "인증",
-        "비밀번호",
-        "계정",
-        "경고",
-        "차단",
-        "잠금",
-        "의심",
-    ]
-    recent_security_df = report_df.dropna(subset=["parsed_date"]).copy()
-    recent_security_df = recent_security_df[recent_security_df["parsed_date"] >= cutoff_date].copy()
-    recent_security_df["combined_text"] = (
-        recent_security_df["subject"].fillna("")
-        + "\n"
-        + recent_security_df["body"].fillna("")
-    ).str.lower()
-    recent_security_df = recent_security_df[
-        recent_security_df["combined_text"].apply(lambda x: any(term in x for term in security_terms))
-    ]
-    recent_security_df = recent_security_df.sort_values("parsed_date", ascending=False)
-
-    recent_security_emails = []
-    for _, row in recent_security_df.iterrows():
-        parsed_date = row.get("parsed_date")
-        recent_security_emails.append(
+    sender_problem_mails: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in preprocessed_records:
+        sender_key = row.get("sender_email") or row.get("sender") or "unknown_sender"
+        sender_problem_mails[sender_key].append(
             {
-                "parsed_date": parsed_date.isoformat() if pd.notna(parsed_date) else None,
                 "subject": row.get("subject", ""),
+                "date": row.get("date", ""),
                 "body": row.get("body", ""),
                 "matched_keywords": row.get("matched_keywords", ""),
             }
         )
 
-    top_subjects = report_df["subject"].value_counts().head(5)
-    top_keywords = sender_profiles.get(selected_sender_key, [])[:15]
+    accounts: list[dict[str, Any]] = []
+    for _, row in sender_status_df.iterrows():
+        score = float(row.get("risk_score", 0.0))
+        account_state = row.get("account_state", "일반 보안 알림")
+        sender_key = str(row.get("sender_key", "unknown_sender"))
+        account_id = f"acct_{hashlib.sha1(sender_key.encode('utf-8')).hexdigest()[:12]}"
+        accounts.append(
+            {
+                "account_id": account_id,
+                "account": row.get("sender_name") or row.get("sender_key"),
+                "security_score": round(score, 3),
+                "security_level": score_to_state(score),
+                "interpretation": state_reason_map.get(
+                    account_state,
+                    "보안 관련 메일 패턴을 바탕으로 추정했습니다.",
+                ),
+                "problem_mails": sender_problem_mails.get(sender_key, []),
+            }
+        )
 
-    return {
-        "sender_key": selected_sender_key,
-        "sender_name": sender_report_row.get("sender_name"),
-        "mail_count": int(sender_report_row.get("mail_count", 0)),
-        "risk_score": risk_score_value,
-        "risk_state": risk_state,
-        "account_state": sender_report_row.get("account_state"),
-        "anomaly_score": float(sender_report_row.get("anomaly_score", 0.0)),
-        "dominant_topic_name": sender_report_row.get("dominant_topic_name"),
-        "analysis_period": {
-            "start": earliest_date.isoformat() if pd.notna(earliest_date) else None,
-            "end": latest_date.isoformat() if pd.notna(latest_date) else None,
-        },
-        "top_subjects": [
-            {"subject": subject, "count": int(count)}
-            for subject, count in top_subjects.items()
-        ],
-        "top_keywords": [
-            {"token": token, "count": int(freq)}
-            for token, freq in top_keywords
-        ],
-        "recent_security_emails_window_months": months,
-        "recent_security_emails_cutoff": cutoff_date.isoformat(),
-        "recent_security_emails_count": len(recent_security_emails),
-        "recent_security_emails": recent_security_emails,
-    }
-
-
-def build_compact_response(
-    random_sender_report: dict[str, Any] | None,
-    sender_status_df: pd.DataFrame,
-) -> dict[str, Any]:
-    compact_report: dict[str, Any] = {}
-    if random_sender_report:
-        compact_report = {
-            "sender_key": random_sender_report.get("sender_key"),
-            "sender_name": random_sender_report.get("sender_name"),
-            "mail_count": random_sender_report.get("mail_count"),
-            "risk_score": random_sender_report.get("risk_score"),
-            "risk_state": random_sender_report.get("risk_state"),
-            "recent_security_emails_count": random_sender_report.get("recent_security_emails_count", 0),
-            "recent_security_emails": random_sender_report.get("recent_security_emails", []),
-        }
-
-    sender_status_top3 = []
-    if not sender_status_df.empty:
-        for _, row in sender_status_df.head(3).iterrows():
-            sender_status_top3.append(
-                {
-                    "sender_name": row.get("sender_name"),
-                    "risk_score": float(row.get("risk_score", 0.0)),
-                    "risk_level": row.get("risk_level"),
-                    "account_state": row.get("account_state"),
-                }
-            )
-
-    return {
-        "random_sender_report": compact_report,
-        "sender_status_top3": sender_status_top3,
-    }
+    return {"accounts": accounts}
 
 
 def run_analysis(
@@ -762,21 +686,27 @@ def run_analysis(
 
     matched = extract_keyword_matches(mbox_path=mbox_path, keywords=keywords)
     if not matched:
-        return {
-            "random_sender_report": {},
-            "sender_status_top3": [],
-        }
+        return {"accounts": []}
 
     preprocessed_records, sender_profiles, sender_mail_counts = preprocess_records(
         matched,
         stopwords,
     )
-    tfidf_data = build_tfidf(preprocessed_records, config)
+    tfidf_data = build_tfidf(
+        preprocessed_records,
+        config,
+        include_mail=config.enable_clustering,
+        include_sender=True,
+    )
 
     kmeans_labels: np.ndarray | None = None
     hdbscan_labels: np.ndarray | None = None
     cluster_results_df: pd.DataFrame | None = None
-    if len(preprocessed_records) >= 10:
+    if (
+        config.enable_clustering
+        and len(preprocessed_records) >= 10
+        and tfidf_data["mail_tfidf_matrix"] is not None
+    ):
         cluster_results_df, kmeans_labels, hdbscan_labels = cluster_mail(
             tfidf_data["mail_tfidf_matrix"],
             preprocessed_records,
@@ -800,14 +730,7 @@ def run_analysis(
         topic_info=topic_info,
     )
 
-    random_sender_report = build_random_sender_report(
+    return build_account_summary(
+        sender_status_df=sender_status_df,
         preprocessed_records=preprocessed_records,
-        sender_status_df=sender_status_df,
-        sender_profiles=sender_profiles,
-        months=6,
-    )
-
-    return build_compact_response(
-        random_sender_report=random_sender_report,
-        sender_status_df=sender_status_df,
     )
