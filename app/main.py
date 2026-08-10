@@ -79,7 +79,11 @@ async def analyze_mbox(file: UploadFile = File(...)) -> AnalyzeMboxResponse:
     _, destination, _ = await save_uploaded_mbox(file)
 
     try:
-        result = run_analysis(mbox_path=destination, keywords=DEFAULT_ANALYSIS_KEYWORDS)
+        result = await asyncio.to_thread(
+            run_analysis,
+            mbox_path=destination,
+            keywords=DEFAULT_ANALYSIS_KEYWORDS,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
     finally:

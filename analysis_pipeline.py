@@ -136,6 +136,10 @@ class AnalysisConfig:
     random_state: int = 42
     enable_clustering: bool = False
     enable_bertopic: bool = False
+    enable_fast_mode: bool = True
+    fast_mode_min_records_for_stats: int = 30
+    fast_mode_max_records_for_stats: int = 1200
+    fast_mode_max_senders_for_stats: int = 300
 
 
 class VisibleTextParser(HTMLParser):
@@ -234,12 +238,47 @@ def extract_text_body(msg: Any) -> str:
     return "\n".join(chunks)
 
 
+def message_may_contain_keywords(msg: Any, keywords: list[str], limit_chars: int = 4000) -> bool:
+    if not keywords:
+        return False
+
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        content_type = part.get_content_type()
+        disposition = str(part.get("Content-Disposition", ""))
+
+        if "attachment" in disposition.lower():
+            continue
+        if content_type not in ["text/plain", "text/html"]:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text = payload.decode(charset, errors="replace")
+        except Exception:
+            text = payload.decode("utf-8", errors="replace")
+
+        snippet = text[:limit_chars]
+        if any(kw in snippet for kw in keywords):
+            return True
+
+    return False
+
+
 def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[dict[str, Any]]:
     matched: list[dict[str, Any]] = []
     mbox = mailbox.mbox(str(mbox_path))
 
     for i, msg in enumerate(mbox):
         subject = decode_mime_words(msg.get("Subject", ""))
+        found_in_subject = [kw for kw in keywords if kw in subject]
+        if not found_in_subject and not message_may_contain_keywords(msg, keywords):
+            continue
+
         sender_raw = decode_mime_words(msg.get("From", ""))
         sender_name, sender_email = parseaddr(sender_raw)
         sender_email = sender_email.lower().strip()
@@ -266,6 +305,20 @@ def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[
             )
 
     return matched
+
+
+def build_default_sender_anomaly(sender_mail_counts: Counter[str]) -> pd.DataFrame:
+    if not sender_mail_counts:
+        return pd.DataFrame(columns=["sender_id", "anomaly_flag", "anomaly_score", "mail_count"])
+
+    return pd.DataFrame(
+        {
+            "sender_id": list(sender_mail_counts.keys()),
+            "anomaly_flag": [1] * len(sender_mail_counts),
+            "anomaly_score": [0.0] * len(sender_mail_counts),
+            "mail_count": [sender_mail_counts[sender] for sender in sender_mail_counts.keys()],
+        }
+    )
 
 
 def preprocess_text(text: str, stopwords: set[str]) -> tuple[str, list[str]]:
@@ -625,11 +678,20 @@ def estimate_sender_status(
 
 
 def score_to_state(score: float) -> str:
-    if score >= 5:
+    if score < 40:
         return "위험"
-    if score >= 2.5:
+    if score < 70:
         return "주의"
     return "양호"
+
+
+def risk_to_security_score(risk_score: float, min_risk: float, max_risk: float) -> float:
+    # Normalize risk to a 0-100 security score within this analysis batch.
+    # Lower risk => higher security score.
+    if max_risk <= min_risk:
+        return 50.0
+    normalized = (max_risk - risk_score) / (max_risk - min_risk)
+    return max(0.0, min(100.0, normalized * 100.0))
 
 
 def build_account_summary(
@@ -660,9 +722,13 @@ def build_account_summary(
             }
         )
 
+    min_risk = float(sender_status_df["risk_score"].min())
+    max_risk = float(sender_status_df["risk_score"].max())
+
     accounts: list[dict[str, Any]] = []
     for _, row in sender_status_df.iterrows():
-        score = float(row.get("risk_score", 0.0))
+        risk_score = float(row.get("risk_score", 0.0))
+        security_score = risk_to_security_score(risk_score, min_risk, max_risk)
         account_state = row.get("account_state", "일반 보안 알림")
         sender_key = str(row.get("sender_key", "unknown_sender"))
         account_id = f"acct_{hashlib.sha1(sender_key.encode('utf-8')).hexdigest()[:12]}"
@@ -670,8 +736,8 @@ def build_account_summary(
             {
                 "account_id": account_id,
                 "account": row.get("sender_name") or row.get("sender_key"),
-                "security_score": round(score, 3),
-                "security_level": score_to_state(score),
+                "security_score": round(security_score, 3),
+                "security_level": score_to_state(security_score),
                 "interpretation": state_reason_map.get(
                     account_state,
                     "보안 관련 메일 패턴을 바탕으로 추정했습니다.",
@@ -700,11 +766,18 @@ def run_analysis(
         matched,
         stopwords,
     )
+
+    use_fast_mode_for_stats = config.enable_fast_mode and (
+        len(preprocessed_records) < config.fast_mode_min_records_for_stats
+        or len(preprocessed_records) > config.fast_mode_max_records_for_stats
+        or len(sender_mail_counts) > config.fast_mode_max_senders_for_stats
+    )
+
     tfidf_data = build_tfidf(
         preprocessed_records,
         config,
         include_mail=config.enable_clustering,
-        include_sender=True,
+        include_sender=not use_fast_mode_for_stats,
     )
 
     kmeans_labels: np.ndarray | None = None
@@ -721,14 +794,18 @@ def run_analysis(
             config,
         )
 
-    topics, topic_info, sender_anomaly_df = topic_and_anomaly(
-        preprocessed_records=preprocessed_records,
-        sender_tfidf_matrix=tfidf_data["sender_tfidf_matrix"],
-        sender_ids=tfidf_data["sender_ids"],
-        sender_mail_counts=sender_mail_counts,
-        stopwords=stopwords,
-        config=config,
-    )
+    topics = [-1] * len(preprocessed_records)
+    topic_info = pd.DataFrame(columns=["Topic", "Count", "Name"])
+    sender_anomaly_df = build_default_sender_anomaly(sender_mail_counts)
+    if not use_fast_mode_for_stats and tfidf_data["sender_tfidf_matrix"] is not None:
+        topics, topic_info, sender_anomaly_df = topic_and_anomaly(
+            preprocessed_records=preprocessed_records,
+            sender_tfidf_matrix=tfidf_data["sender_tfidf_matrix"],
+            sender_ids=tfidf_data["sender_ids"],
+            sender_mail_counts=sender_mail_counts,
+            stopwords=stopwords,
+            config=config,
+        )
 
     sender_status_df = estimate_sender_status(
         preprocessed_records=preprocessed_records,
