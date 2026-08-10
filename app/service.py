@@ -127,3 +127,11 @@ def run_job(db: Session, job: AnalysisJob) -> None:
             synchronize_session=False,
         )
         db.commit()
+    finally:
+        mbox_path = Path(job.mbox_path)
+        if mbox_path.exists():
+            try:
+                mbox_path.unlink()
+            except Exception:
+                # Best-effort cleanup to avoid failing job finalization.
+                pass

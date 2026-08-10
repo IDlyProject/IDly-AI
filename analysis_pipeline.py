@@ -357,15 +357,23 @@ def build_tfidf(
             sender_documents[sender_key].append(" ".join(row["tokens"]))
 
         sender_ids = list(sender_documents.keys())
-        sender_corpus = [" ".join(sender_documents[sender]) for sender in sender_ids]
+        sender_corpus = [" ".join(sender_documents[sender]).strip() for sender in sender_ids]
+        sender_corpus = [doc if doc else "security" for doc in sender_corpus]
+        sender_max_df = config.max_df_sender if len(sender_corpus) > 1 else 1.0
 
         sender_vectorizer = TfidfVectorizer(
             max_features=config.sender_tfidf_max_features,
             min_df=1,
-            max_df=config.max_df_sender,
+            max_df=sender_max_df,
             ngram_range=config.ngram_range,
         )
-        sender_tfidf_matrix = sender_vectorizer.fit_transform(sender_corpus)
+        try:
+            sender_tfidf_matrix = sender_vectorizer.fit_transform(sender_corpus)
+        except ValueError as exc:
+            if "empty vocabulary" not in str(exc).lower():
+                raise
+            # Fallback for edge cases where all tokens are removed by preprocessing.
+            sender_tfidf_matrix = sender_vectorizer.fit_transform(["security"] * len(sender_corpus))
         sender_feature_names = sender_vectorizer.get_feature_names_out()
 
     return {
