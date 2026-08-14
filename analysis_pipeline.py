@@ -18,6 +18,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import IsolationForest
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 try:
     import hdbscan
@@ -157,6 +158,69 @@ def compute_security_relevance_score(text: str) -> int:
         - hits(SECURITY_OFFTOPIC_TERMS) * 3
     )
     return score
+
+
+# 한국어 전용 문장 임베딩 모델(ko-sroberta-multitask)로 보안 메일 여부를 의미 기반으로 판단한다.
+# 단순 키워드 포함 여부 대신, 실제 보안 알림 문맥/무관한 문맥(채용·마케팅·결제 등) 각각의
+# 예시 문장 centroid와의 코사인 유사도 차이로 점수를 매긴다.
+KOREAN_SENTENCE_MODEL_NAME = "jhgan/ko-sroberta-multitask"
+
+SECURITY_MAIL_REFERENCES = [
+    "고객님의 계정에서 새로운 기기로 로그인이 감지되어 본인 확인이 필요합니다.",
+    "비밀번호 재설정 요청이 접수되었습니다. 본인이 아니라면 즉시 계정을 보호하세요.",
+    "회원님의 계정에서 의심스러운 로그인 시도가 발견되어 보안을 위해 접근을 차단했습니다.",
+    "인증 코드가 발급되었습니다. 타인에게 공유하지 마시고 본인 확인에 사용하세요.",
+    "계정 보안 경고: 알 수 없는 위치에서의 접속 시도가 확인되었습니다.",
+    "회원님의 계정 비밀번호가 변경되었습니다. 본인이 변경하지 않았다면 고객센터로 문의하세요.",
+]
+NON_SECURITY_MAIL_REFERENCES = [
+    "이번 주 특가 할인 이벤트에 참여하고 다양한 쿠폰 혜택을 받아보세요.",
+    "신규 채용 공고 안내드립니다. 많은 지원 부탁드립니다.",
+    "주문하신 상품이 결제 완료되어 배송이 시작되었습니다. 결제하신 카드 정보는 안전하게 보호됩니다.",
+    "이번 달 뉴스레터를 통해 새로운 소식을 전해드립니다.",
+    "세미나 참가 신청이 완료되었습니다. 자세한 일정은 첨부파일을 확인하세요.",
+    "결제 영수증을 첨부해드립니다. 문의사항은 고객센터로 연락 주세요.",
+]
+
+SEMANTIC_SECURITY_MARGIN_THRESHOLD = 0.12
+
+_sentence_model = None
+_security_ref_centroid = None
+_nonsecurity_ref_centroid = None
+_semantic_model_load_failed = False
+
+
+def _get_korean_sentence_model():
+    """한국어 문장 임베딩 모델을 지연 로드하고, 실패하면 이후 호출에서 재시도하지 않는다."""
+    global _sentence_model, _security_ref_centroid, _nonsecurity_ref_centroid, _semantic_model_load_failed
+    if _semantic_model_load_failed:
+        return None, None, None
+    if _sentence_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            _sentence_model = SentenceTransformer(KOREAN_SENTENCE_MODEL_NAME)
+            security_embeddings = _sentence_model.encode(SECURITY_MAIL_REFERENCES)
+            nonsecurity_embeddings = _sentence_model.encode(NON_SECURITY_MAIL_REFERENCES)
+            _security_ref_centroid = security_embeddings.mean(axis=0, keepdims=True)
+            _nonsecurity_ref_centroid = nonsecurity_embeddings.mean(axis=0, keepdims=True)
+        except Exception:
+            _semantic_model_load_failed = True
+            return None, None, None
+    return _sentence_model, _security_ref_centroid, _nonsecurity_ref_centroid
+
+
+def compute_semantic_security_score(text: str) -> float | None:
+    """score = sim(메일, 보안메일 centroid) - sim(메일, 무관메일 centroid).
+    모델을 불러올 수 없으면 None을 반환해 lexicon 기반 점수로 대체한다."""
+    model, security_centroid, nonsecurity_centroid = _get_korean_sentence_model()
+    if model is None:
+        return None
+
+    embedding = model.encode([(text or "")[:512]])
+    sim_security = cosine_similarity(embedding, security_centroid)[0][0]
+    sim_nonsecurity = cosine_similarity(embedding, nonsecurity_centroid)[0][0]
+    return float(sim_security - sim_nonsecurity)
 
 
 @dataclass
@@ -328,10 +392,20 @@ def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[
 
         searchable = f"{subject}\n{body}"
         found_keywords = [kw for kw in keywords if kw in searchable]
-        relevance_score = compute_security_relevance_score(searchable)
+        if not found_keywords:
+            continue
 
-        # 키워드가 있어도 채용/마케팅/결제 등 무관한 맥락이면 제외한다.
-        if found_keywords and relevance_score >= SECURITY_RELEVANCE_THRESHOLD:
+        # 한국어 문장 임베딩 모델로 실제 보안 알림 문맥에 가까운지 의미 기반으로 판단한다.
+        # 모델을 쓸 수 없는 환경(다운로드 실패 등)에서는 lexicon 점수로 대체한다.
+        semantic_score = compute_semantic_security_score(searchable)
+        if semantic_score is not None:
+            relevance_score = semantic_score
+            is_security_mail = semantic_score >= SEMANTIC_SECURITY_MARGIN_THRESHOLD
+        else:
+            relevance_score = compute_security_relevance_score(searchable)
+            is_security_mail = relevance_score >= SECURITY_RELEVANCE_THRESHOLD
+
+        if is_security_mail:
             matched.append(
                 {
                     "index": i,
@@ -662,9 +736,10 @@ def estimate_sender_status(
 
     def most_common_value(series: pd.Series) -> Any:
         series = pd.Series(series)
-        if series.empty:
+        counts = series.value_counts()
+        if counts.empty:
             return None
-        return series.value_counts().idxmax()
+        return counts.idxmax()
 
     sender_status_df = (
         sender_analysis_df.groupby("sender_key")
