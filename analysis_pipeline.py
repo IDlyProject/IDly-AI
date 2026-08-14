@@ -119,6 +119,45 @@ DEFAULT_STOPWORDS = {
     "flex",
 }
 
+# 간단한 규칙 기반 NLP: 키워드가 실제 보안 알림 맥락에서 쓰였는지 가중치로 판단한다.
+# 강한 신호(구체적 보안 조치/위협 표현)일수록 가중치를 높게, 흔한 마케팅/채용/결제 표현은 감점한다.
+SECURITY_STRONG_TERMS = [
+    "비밀번호", "재설정", "password", "reset",
+    "로그인", "signin", "sign in", "새로 로그인", "새로운 로그인", "신규 기기", "새로운 위치",
+    "인증", "otp", "verify", "verification", "본인 확인",
+    "피싱", "phishing", "해킹", "hack", "유출", "탈취", "breach",
+    "의심스러운", "suspicious", "위협", "차단", "잠금", "잠김", "unauthorized",
+    "승인", "복구", "recover", "recovery",
+]
+SECURITY_MODERATE_TERMS = [
+    "보안", "security", "계정 보호", "account protection",
+    "경고", "알림", "alert", "notice", "조치", "권장", "review", "확인 요청",
+]
+SECURITY_OFFTOPIC_TERMS = [
+    "채용", "구인", "구직", "공고", "recruit", "hiring", "career",
+    "이벤트", "할인", "쿠폰", "세일", "sale", "discount", "적립금", "사은품",
+    "뉴스레터", "newsletter", "unsubscribe", "광고", "advertisement",
+    "결제", "주문", "배송", "환불", "영수증", "invoice", "receipt",
+    "세미나", "웨비나", "webinar", "컨퍼런스", "conference",
+]
+
+SECURITY_RELEVANCE_THRESHOLD = 2
+
+
+def compute_security_relevance_score(text: str) -> int:
+    """가중치 기반 lexicon 스코어. 단순 문자열 포함 여부 대신 맥락 신호를 합산해 판단한다."""
+    lowered = (text or "").lower()
+
+    def hits(terms: list[str]) -> int:
+        return sum(min(lowered.count(term.lower()), 3) for term in terms)
+
+    score = (
+        hits(SECURITY_STRONG_TERMS) * 3
+        + hits(SECURITY_MODERATE_TERMS) * 2
+        - hits(SECURITY_OFFTOPIC_TERMS) * 3
+    )
+    return score
+
 
 @dataclass
 class AnalysisConfig:
@@ -289,8 +328,10 @@ def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[
 
         searchable = f"{subject}\n{body}"
         found_keywords = [kw for kw in keywords if kw in searchable]
+        relevance_score = compute_security_relevance_score(searchable)
 
-        if found_keywords:
+        # 키워드가 있어도 채용/마케팅/결제 등 무관한 맥락이면 제외한다.
+        if found_keywords and relevance_score >= SECURITY_RELEVANCE_THRESHOLD:
             matched.append(
                 {
                     "index": i,
@@ -301,6 +342,7 @@ def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[
                     "date": date,
                     "body": body,
                     "matched_keywords": ", ".join(found_keywords),
+                    "security_relevance_score": relevance_score,
                 }
             )
 
