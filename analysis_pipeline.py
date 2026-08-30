@@ -190,6 +190,22 @@ _nonsecurity_ref_centroid = None
 _semantic_model_load_failed = False
 
 
+def _preload_korean_sentence_model():
+    """한국어 문장 임베딩 모델을 프리로드한다 (동기 함수, 스레드에서 실행됨)"""
+    global _sentence_model, _security_ref_centroid, _nonsecurity_ref_centroid, _semantic_model_load_failed
+    if _semantic_model_load_failed or _sentence_model is not None:
+        return
+    try:
+        from sentence_transformers import SentenceTransformer
+        _sentence_model = SentenceTransformer(KOREAN_SENTENCE_MODEL_NAME)
+        security_embeddings = _sentence_model.encode(SECURITY_MAIL_REFERENCES)
+        nonsecurity_embeddings = _sentence_model.encode(NON_SECURITY_MAIL_REFERENCES)
+        _security_ref_centroid = security_embeddings.mean(axis=0, keepdims=True)
+        _nonsecurity_ref_centroid = nonsecurity_embeddings.mean(axis=0, keepdims=True)
+    except Exception:
+        _semantic_model_load_failed = True
+
+
 def _get_korean_sentence_model():
     """한국어 문장 임베딩 모델을 지연 로드하고, 실패하면 이후 호출에서 재시도하지 않는다."""
     global _sentence_model, _security_ref_centroid, _nonsecurity_ref_centroid, _semantic_model_load_failed
