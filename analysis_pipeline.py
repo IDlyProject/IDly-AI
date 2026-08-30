@@ -4,6 +4,7 @@ import html
 import hashlib
 import logging
 import mailbox
+import os
 import re
 import time
 from collections import Counter, defaultdict
@@ -12,7 +13,7 @@ from email.header import decode_header
 from email.utils import parseaddr
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +216,13 @@ def _get_korean_sentence_model():
     global _sentence_model, _security_ref_centroid, _nonsecurity_ref_centroid, _semantic_model_load_failed
     if _semantic_model_load_failed:
         return None, None, None
+    if os.getenv("ENABLE_SEMANTIC_MODEL", "false").strip().lower() not in ("1", "true", "yes"):
+        # torch + sentence-transformers 모델(수백MB)을 로드하면 메모리가 넉넉하지 않은 인스턴스에서는
+        # OOM으로 프로세스 자체가 죽을 수 있다(요청 로그도 안 남기고 502로 끝남). 기본값은 비활성화하고
+        # lexicon 기반 점수(compute_security_relevance_score)로 대체하며, 여유 있는 환경에서만
+        # ENABLE_SEMANTIC_MODEL=true 로 명시적으로 켠다.
+        _semantic_model_load_failed = True
+        return None, None, None
     if _sentence_model is None:
         try:
             from sentence_transformers import SentenceTransformer
@@ -231,16 +239,37 @@ def _get_korean_sentence_model():
 
 
 def compute_semantic_security_score(text: str) -> float | None:
-    """score = sim(메일, 보안메일 centroid) - sim(메일, 무관메일 centroid).
-    모델을 불러올 수 없으면 None을 반환해 lexicon 기반 점수로 대체한다."""
+    """score = sim(mail, security centroid) - sim(mail, non-security centroid).
+    Returns None (falls back to lexicon scoring) if the model can't be loaded."""
+    scores = compute_semantic_security_scores_batch([text])
+    if scores is None:
+        return None
+    return scores[0]
+
+
+def compute_semantic_security_scores_batch(texts: list[str]) -> list[float] | None:
+    """Batch version of compute_semantic_security_score.
+
+    Encoding one message at a time (the original implementation) means the
+    embedding model's per-call overhead accumulates linearly with the number of
+    matched messages, which is the main reason large mboxes exceeded Render's
+    request timeout and surfaced as a 502 at /analyze. Batching all candidate
+    texts into a single model.encode() call fixes that without changing the
+    scoring semantics. Returns None (falls back to lexicon scoring) if the
+    embedding model is unavailable.
+    """
+    if not texts:
+        return []
+
     model, security_centroid, nonsecurity_centroid = _get_korean_sentence_model()
     if model is None:
         return None
 
-    embedding = model.encode([(text or "")[:512]])
-    sim_security = cosine_similarity(embedding, security_centroid)[0][0]
-    sim_nonsecurity = cosine_similarity(embedding, nonsecurity_centroid)[0][0]
-    return float(sim_security - sim_nonsecurity)
+    truncated = [(text or "")[:512] for text in texts]
+    embeddings = model.encode(truncated, batch_size=32, show_progress_bar=False)
+    sim_security = cosine_similarity(embeddings, security_centroid)[:, 0]
+    sim_nonsecurity = cosine_similarity(embeddings, nonsecurity_centroid)[:, 0]
+    return (sim_security - sim_nonsecurity).astype(float).tolist()
 
 
 @dataclass
@@ -393,9 +422,10 @@ def message_may_contain_keywords(msg: Any, keywords: list[str], limit_chars: int
 
 
 def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[dict[str, Any]]:
-    matched: list[dict[str, Any]] = []
     mbox = mailbox.mbox(str(mbox_path))
 
+    # Pass 1: cheap keyword filtering only, no model calls yet.
+    candidates: list[dict[str, Any]] = []
     for i, msg in enumerate(mbox):
         subject = decode_mime_words(msg.get("Subject", ""))
         found_in_subject = [kw for kw in keywords if kw in subject]
@@ -415,27 +445,53 @@ def extract_keyword_matches(mbox_path: str | Path, keywords: list[str]) -> list[
         if not found_keywords:
             continue
 
-        # 한국어 문장 임베딩 모델로 실제 보안 알림 문맥에 가까운지 의미 기반으로 판단한다.
-        # 모델을 쓸 수 없는 환경(다운로드 실패 등)에서는 lexicon 점수로 대체한다.
-        semantic_score = compute_semantic_security_score(searchable)
-        if semantic_score is not None:
-            relevance_score = semantic_score
-            is_security_mail = semantic_score >= SEMANTIC_SECURITY_MARGIN_THRESHOLD
+        candidates.append(
+            {
+                "index": i,
+                "sender": sender,
+                "sender_email": sender_email,
+                "sender_domain": sender_domain,
+                "subject": subject,
+                "date": date,
+                "body": body,
+                "searchable": searchable,
+                "matched_keywords": ", ".join(found_keywords),
+            }
+        )
+
+    if not candidates:
+        return []
+
+    # Pass 2: score the semantic security relevance of every candidate in a single
+    # batched model call instead of one encode() per message. Calling encode() once
+    # per message (the previous behavior) meant model overhead accumulated linearly
+    # with the number of matched messages, which is the main reason large mboxes
+    # blew past Render's request timeout and surfaced as a 502.
+    # Falls back to lexicon scoring if the embedding model is unavailable.
+    semantic_scores = compute_semantic_security_scores_batch(
+        [candidate["searchable"] for candidate in candidates]
+    )
+
+    matched: list[dict[str, Any]] = []
+    for idx, candidate in enumerate(candidates):
+        if semantic_scores is not None:
+            relevance_score = semantic_scores[idx]
+            is_security_mail = relevance_score >= SEMANTIC_SECURITY_MARGIN_THRESHOLD
         else:
-            relevance_score = compute_security_relevance_score(searchable)
+            relevance_score = compute_security_relevance_score(candidate["searchable"])
             is_security_mail = relevance_score >= SECURITY_RELEVANCE_THRESHOLD
 
         if is_security_mail:
             matched.append(
                 {
-                    "index": i,
-                    "sender": sender,
-                    "sender_email": sender_email,
-                    "sender_domain": sender_domain,
-                    "subject": subject,
-                    "date": date,
-                    "body": body,
-                    "matched_keywords": ", ".join(found_keywords),
+                    "index": candidate["index"],
+                    "sender": candidate["sender"],
+                    "sender_email": candidate["sender_email"],
+                    "sender_domain": candidate["sender_domain"],
+                    "subject": candidate["subject"],
+                    "date": candidate["date"],
+                    "body": candidate["body"],
+                    "matched_keywords": candidate["matched_keywords"],
                     "security_relevance_score": relevance_score,
                 }
             )
@@ -891,19 +947,33 @@ def run_analysis(
     keywords: list[str],
     config: AnalysisConfig | None = None,
     stopwords: set[str] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     config = config or AnalysisConfig()
     stopwords = stopwords or DEFAULT_STOPWORDS
-    
+
+    def report(pct: int) -> None:
+        # 잡 큐(app/service.py)가 이 콜백으로 단계별 진행률을 DB에 기록한다.
+        # 콜백 자체가 실패해도 분석은 계속되어야 하므로 예외는 삼킨다.
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(pct)
+        except Exception:
+            logger.debug("progress_callback failed", exc_info=True)
+
     start_total = time.time()
 
-    # 1. 키워드 매칭
+    # 1. 키워드 매칭 + NLP 의미 기반 스코어링(가장 무거운 단계)
+    report(10)
     start = time.time()
     matched = extract_keyword_matches(mbox_path=mbox_path, keywords=keywords)
     elapsed = time.time() - start
     logger.info(f"[PROFILE] extract_keyword_matches: {elapsed:.2f}s (found {len(matched) if matched else 0} emails)")
-    
+    report(45)
+
     if not matched:
+        report(100)
         return {"accounts": []}
 
     # 2. 전처리
@@ -914,6 +984,7 @@ def run_analysis(
     )
     elapsed = time.time() - start
     logger.info(f"[PROFILE] preprocess_records: {elapsed:.2f}s ({len(preprocessed_records)} records)")
+    report(55)
 
     use_fast_mode_for_stats = config.enable_fast_mode and (
         len(preprocessed_records) < config.fast_mode_min_records_for_stats
@@ -932,6 +1003,7 @@ def run_analysis(
     )
     elapsed = time.time() - start
     logger.info(f"[PROFILE] build_tfidf: {elapsed:.2f}s")
+    report(65)
 
     # 4. 클러스터링
     kmeans_labels: np.ndarray | None = None
@@ -952,6 +1024,7 @@ def run_analysis(
         logger.info(f"[PROFILE] cluster_mail: {elapsed:.2f}s")
     else:
         logger.info(f"[PROFILE] cluster_mail: skipped (clustering disabled or too few records)")
+    report(75)
 
     # 5. 토픽 & 이상 탐지
     topics = [-1] * len(preprocessed_records)
@@ -971,6 +1044,7 @@ def run_analysis(
         logger.info(f"[PROFILE] topic_and_anomaly: {elapsed:.2f}s")
     else:
         logger.info(f"[PROFILE] topic_and_anomaly: skipped (fast mode or no sender tfidf)")
+    report(85)
 
     # 6. 최종 분석
     start = time.time()
@@ -983,6 +1057,7 @@ def run_analysis(
     )
     elapsed = time.time() - start
     logger.info(f"[PROFILE] estimate_sender_status: {elapsed:.2f}s")
+    report(92)
 
     # 7. 결과 구성
     start = time.time()
@@ -995,5 +1070,6 @@ def run_analysis(
     
     total_elapsed = time.time() - start_total
     logger.info(f"[PROFILE] TOTAL: {total_elapsed:.2f}s")
-    
+    report(100)
+
     return result

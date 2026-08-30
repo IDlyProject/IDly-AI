@@ -90,17 +90,35 @@ def claim_next_job(db: Session) -> AnalysisJob | None:
 
 
 def run_job(db: Session, job: AnalysisJob) -> None:
-    try:
+    def report_progress(pct: int) -> None:
+        # run_analysis가 단계(키워드 매칭+NLP -> 전처리 -> TFIDF -> 클러스터링 -> ...)마다
+        # 호출하는 콜백. 클라이언트는 GET /analyze/{job_id}로 이 값을 폴링해 진행 상황을 본다.
         db.query(AnalysisJob).filter(AnalysisJob.id == job.id).update(
             {
-                AnalysisJob.progress: 20,
+                AnalysisJob.progress: min(max(pct, 0), 99),
                 AnalysisJob.updated_at: utcnow(),
             },
             synchronize_session=False,
         )
         db.commit()
 
-        result = run_analysis(mbox_path=job.mbox_path, keywords=job.request_keywords)
+    try:
+        db.query(AnalysisJob).filter(AnalysisJob.id == job.id).update(
+            {
+                AnalysisJob.status: JobStatus.running.value,
+                AnalysisJob.progress: 5,
+                AnalysisJob.started_at: job.started_at or utcnow(),
+                AnalysisJob.updated_at: utcnow(),
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+
+        result = run_analysis(
+            mbox_path=job.mbox_path,
+            keywords=job.request_keywords,
+            progress_callback=report_progress,
+        )
         serialized = normalize_for_json(result)
 
         db.query(AnalysisJob).filter(AnalysisJob.id == job.id).update(
