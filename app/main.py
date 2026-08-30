@@ -65,9 +65,6 @@ async def save_uploaded_mbox(file: UploadFile) -> tuple[str, Path, int]:
     if not original_name or not original_name.lower().endswith(".mbox"):
         raise HTTPException(status_code=400, detail="Only .mbox files are allowed")
 
-    # 최대 50MB 제한
-    MAX_FILE_SIZE = 50 * 1024 * 1024
-    
     safe_stem = Path(original_name).stem.replace(" ", "_")
     stored_name = f"{safe_stem}_{uuid.uuid4().hex}.mbox"
     destination = UPLOAD_DIR / stored_name
@@ -80,16 +77,7 @@ async def save_uploaded_mbox(file: UploadFile) -> tuple[str, Path, int]:
                 if not chunk:
                     break
                 total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    if destination.exists():
-                        destination.unlink()
-                    raise HTTPException(
-                        status_code=413, 
-                        detail=f"File size exceeds maximum of {MAX_FILE_SIZE // (1024*1024)}MB"
-                    )
                 handle.write(chunk)
-    except HTTPException:
-        raise
     except Exception as exc:
         if destination.exists():
             destination.unlink()
@@ -110,23 +98,12 @@ async def analyze_mbox(file: UploadFile = File(...)) -> AnalyzeMboxResponse:
     _, destination, _ = await save_uploaded_mbox(file)
 
     try:
-        # 120초 타임아웃
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                run_analysis,
-                mbox_path=destination,
-                keywords=DEFAULT_ANALYSIS_KEYWORDS,
-            ),
-            timeout=120
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"Analysis timeout for {destination.name}")
-        raise HTTPException(
-            status_code=504,
-            detail="Analysis took too long. Please try with a smaller file."
+        result = await asyncio.to_thread(
+            run_analysis,
+            mbox_path=destination,
+            keywords=DEFAULT_ANALYSIS_KEYWORDS,
         )
     except Exception as exc:
-        logger.error(f"Analysis failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
     finally:
         if destination.exists():
