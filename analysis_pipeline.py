@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import html
 import hashlib
+import logging
 import mailbox
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from email.header import decode_header
@@ -11,6 +13,8 @@ from email.utils import parseaddr
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -890,29 +894,46 @@ def run_analysis(
 ) -> dict[str, Any]:
     config = config or AnalysisConfig()
     stopwords = stopwords or DEFAULT_STOPWORDS
+    
+    start_total = time.time()
 
+    # 1. 키워드 매칭
+    start = time.time()
     matched = extract_keyword_matches(mbox_path=mbox_path, keywords=keywords)
+    elapsed = time.time() - start
+    logger.info(f"[PROFILE] extract_keyword_matches: {elapsed:.2f}s (found {len(matched) if matched else 0} emails)")
+    
     if not matched:
         return {"accounts": []}
 
+    # 2. 전처리
+    start = time.time()
     preprocessed_records, sender_profiles, sender_mail_counts = preprocess_records(
         matched,
         stopwords,
     )
+    elapsed = time.time() - start
+    logger.info(f"[PROFILE] preprocess_records: {elapsed:.2f}s ({len(preprocessed_records)} records)")
 
     use_fast_mode_for_stats = config.enable_fast_mode and (
         len(preprocessed_records) < config.fast_mode_min_records_for_stats
         or len(preprocessed_records) > config.fast_mode_max_records_for_stats
         or len(sender_mail_counts) > config.fast_mode_max_senders_for_stats
     )
+    logger.info(f"[PROFILE] fast_mode_enabled: {use_fast_mode_for_stats}")
 
+    # 3. TFIDF 벡터화
+    start = time.time()
     tfidf_data = build_tfidf(
         preprocessed_records,
         config,
         include_mail=config.enable_clustering,
         include_sender=not use_fast_mode_for_stats,
     )
+    elapsed = time.time() - start
+    logger.info(f"[PROFILE] build_tfidf: {elapsed:.2f}s")
 
+    # 4. 클러스터링
     kmeans_labels: np.ndarray | None = None
     hdbscan_labels: np.ndarray | None = None
     cluster_results_df: pd.DataFrame | None = None
@@ -921,16 +942,23 @@ def run_analysis(
         and len(preprocessed_records) >= 10
         and tfidf_data["mail_tfidf_matrix"] is not None
     ):
+        start = time.time()
         cluster_results_df, kmeans_labels, hdbscan_labels = cluster_mail(
             tfidf_data["mail_tfidf_matrix"],
             preprocessed_records,
             config,
         )
+        elapsed = time.time() - start
+        logger.info(f"[PROFILE] cluster_mail: {elapsed:.2f}s")
+    else:
+        logger.info(f"[PROFILE] cluster_mail: skipped (clustering disabled or too few records)")
 
+    # 5. 토픽 & 이상 탐지
     topics = [-1] * len(preprocessed_records)
     topic_info = pd.DataFrame(columns=["Topic", "Count", "Name"])
     sender_anomaly_df = build_default_sender_anomaly(sender_mail_counts)
     if not use_fast_mode_for_stats and tfidf_data["sender_tfidf_matrix"] is not None:
+        start = time.time()
         topics, topic_info, sender_anomaly_df = topic_and_anomaly(
             preprocessed_records=preprocessed_records,
             sender_tfidf_matrix=tfidf_data["sender_tfidf_matrix"],
@@ -939,7 +967,13 @@ def run_analysis(
             stopwords=stopwords,
             config=config,
         )
+        elapsed = time.time() - start
+        logger.info(f"[PROFILE] topic_and_anomaly: {elapsed:.2f}s")
+    else:
+        logger.info(f"[PROFILE] topic_and_anomaly: skipped (fast mode or no sender tfidf)")
 
+    # 6. 최종 분석
+    start = time.time()
     sender_status_df = estimate_sender_status(
         preprocessed_records=preprocessed_records,
         sender_anomaly_df=sender_anomaly_df,
@@ -947,8 +981,19 @@ def run_analysis(
         topics=topics,
         topic_info=topic_info,
     )
+    elapsed = time.time() - start
+    logger.info(f"[PROFILE] estimate_sender_status: {elapsed:.2f}s")
 
-    return build_account_summary(
+    # 7. 결과 구성
+    start = time.time()
+    result = build_account_summary(
         sender_status_df=sender_status_df,
         preprocessed_records=preprocessed_records,
     )
+    elapsed = time.time() - start
+    logger.info(f"[PROFILE] build_account_summary: {elapsed:.2f}s")
+    
+    total_elapsed = time.time() - start_total
+    logger.info(f"[PROFILE] TOTAL: {total_elapsed:.2f}s")
+    
+    return result
