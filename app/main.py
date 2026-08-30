@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 
-from analysis_pipeline import run_analysis, _preload_korean_sentence_model
+from analysis_pipeline import run_analysis
 
 from .db import BASE_DIR
 from .schemas import (
@@ -39,25 +39,10 @@ async def _keep_alive() -> None:
                 logger.debug(f"Keep-alive ping failed: {e}")
             await asyncio.sleep(14 * 60)  # 14분마다
 
-async def _preload_model_background() -> None:
-    """백그라운드에서 모델 프리로드 시도 (실패해도 무시)"""
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(_preload_korean_sentence_model),
-            timeout=120  # 2분 타임아웃
-        )
-        logger.info("Korean sentence model loaded successfully")
-    except asyncio.TimeoutError:
-        logger.warning("Korean sentence model load timed out, will use lexicon-based scoring")
-    except Exception as e:
-        logger.warning(f"Failed to load Korean sentence model: {e}, will use lexicon-based scoring")
-
 @app.on_event("startup")
 async def startup_event() -> None:
-    # Keep-alive 태스크
+    # Keep-alive 태스크만 실행
     asyncio.create_task(_keep_alive())
-    # 모델 프리로드 (실패해도 서버는 정상 작동)
-    asyncio.create_task(_preload_model_background())
 
 
 async def save_uploaded_mbox(file: UploadFile) -> tuple[str, Path, int]:
