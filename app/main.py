@@ -7,10 +7,10 @@ import uuid
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 
 from .db import BASE_DIR, Base, SessionLocal, engine
-from .models import JobStatus
+from .models import Job, JobStatus
 from .schemas import JobCreatedResponse, JobStatusResponse
 from .service import create_job, get_job, run_job
 
@@ -22,12 +22,20 @@ DEFAULT_ANALYSIS_KEYWORDS = ["보안"]
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# 업로드 용량 제한 없음: /analyze는 비동기 job이라 처리 시간이 길어져도 HTTP 요청이
-# 걸려 있지 않으므로 게이트웨이 타임아웃 위험이 없다. 대신 파일이 클수록 백그라운드
-# 잡 처리 시간(및 메모리 사용량)이 그만큼 늘어난다.
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # Render 프리티어 cold start 방지: 14분마다 자기 자신에게 핑
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+_INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
+
+
+def verify_internal_secret(x_internal_secret: str = Header(default="")) -> None:
+    """IDly-Back 전용 내부 인증. INTERNAL_SECRET 환경변수가 설정된 경우에만 검증한다."""
+    if not _INTERNAL_SECRET:
+        return  # 환경변수 미설정 시 개발 편의를 위해 통과
+    if x_internal_secret != _INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 async def _keep_alive() -> None:
@@ -45,10 +53,22 @@ async def _keep_alive() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    # 잡 큐 테이블 생성. worker.py를 별도 프로세스로 안 띄워도 이 웹 서비스 단독으로
-    # /analyze -> 백그라운드 잡 실행까지 전부 처리할 수 있어야 하므로 여기서도 생성해둔다.
     Base.metadata.create_all(bind=engine)
-    # Keep-alive 태스크
+
+    # 서버 재시작 시 running 상태로 멈춘 잡을 failed로 리셋.
+    # 인메모리 태스크가 사라졌으므로 영구 미완료 상태를 방지한다.
+    db = SessionLocal()
+    try:
+        stuck = db.query(Job).filter(Job.status == JobStatus.running.value).all()
+        for job in stuck:
+            job.status = JobStatus.failed.value
+            job.error_message = "Server restarted while job was running"
+        if stuck:
+            db.commit()
+            logger.warning(f"[startup] {len(stuck)} stuck running job(s) reset to failed")
+    finally:
+        db.close()
+
     asyncio.create_task(_keep_alive())
 
 
@@ -69,8 +89,15 @@ async def save_uploaded_mbox(file: UploadFile) -> tuple[str, Path, int]:
                 if not chunk:
                     break
                 total_size += len(chunk)
+                if total_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Maximum allowed size is {MAX_UPLOAD_BYTES // 1024 // 1024} MB.",
+                    )
                 handle.write(chunk)
     except HTTPException:
+        if destination.exists():
+            destination.unlink()
         raise
     except Exception as exc:
         if destination.exists():
@@ -83,9 +110,7 @@ async def save_uploaded_mbox(file: UploadFile) -> tuple[str, Path, int]:
 
 
 def _run_job_sync(job_id: str) -> None:
-    """asyncio.to_thread를 통해 별도 스레드에서 실행된다. 요청을 처리하던 세션을 그대로
-    재사용하면 스레드 세이프하지 않으므로, 이 잡 전용 DB 세션을 새로 열어 끝까지 그 안에서만
-    사용한다."""
+    """asyncio.to_thread를 통해 별도 스레드에서 실행된다."""
     db = SessionLocal()
     try:
         job = get_job(db, job_id)
@@ -98,11 +123,6 @@ def _run_job_sync(job_id: str) -> None:
 
 
 async def _run_job_background(job_id: str) -> None:
-    """NLP(의미 기반 스코어링) -> 분석(TFIDF/클러스터링/이상탐지) 전 단계를 서버가 자동으로
-    이어서 실행한다. 클라이언트는 결과를 기다리지 않고 즉시 job_id를 받으며, 이 태스크는
-    HTTP 요청/응답 사이클과 완전히 분리돼 있어 Render 게이트웨이 타임아웃에 걸려 502가
-    나는 경우가 없다. (다만 이 프로세스 자체가 재시작되면 실행 중이던 잡은 이어받지
-    못하고 running 상태로 멈춘다 - 별도 워커 프로세스로 분리하기 전까지의 알려진 한계.)"""
     try:
         await asyncio.to_thread(_run_job_sync, job_id)
     except Exception:
@@ -114,11 +134,15 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/analyze", response_model=JobCreatedResponse, status_code=202)
+@app.post(
+    "/analyze",
+    response_model=JobCreatedResponse,
+    status_code=202,
+    dependencies=[Depends(verify_internal_secret)],
+)
 async def analyze_mbox(file: UploadFile = File(...)) -> JobCreatedResponse:
     """.mbox를 업로드하면 분석 잡을 큐에 넣고 즉시 job_id를 반환한다 (202 Accepted).
-    실제 NLP 스코어링 + 분석은 백그라운드에서 서버가 자동으로 이어서 실행하며,
-    진행 상황과 최종 결과는 GET /analyze/{job_id}로 폴링해서 확인한다."""
+    X-Internal-Secret 헤더 인증 필요."""
     _, destination, _ = await save_uploaded_mbox(file)
 
     db = SessionLocal()
@@ -137,7 +161,11 @@ async def analyze_mbox(file: UploadFile = File(...)) -> JobCreatedResponse:
     return JobCreatedResponse(job_id=job_id, status=JobStatus.queued.value)
 
 
-@app.get("/analyze/{job_id}", response_model=JobStatusResponse)
+@app.get(
+    "/analyze/{job_id}",
+    response_model=JobStatusResponse,
+    dependencies=[Depends(verify_internal_secret)],
+)
 def get_analysis_status(job_id: str) -> JobStatusResponse:
     db = SessionLocal()
     try:

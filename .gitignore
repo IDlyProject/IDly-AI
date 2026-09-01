@@ -1,3 +1,6 @@
 .venv/
 .ipynb_checkpoints/
-0102*.mbox
+*.mbox
+*.eml
+jobs.db
+uploads/
