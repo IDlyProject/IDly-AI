@@ -22,10 +22,6 @@ DEFAULT_ANALYSIS_KEYWORDS = ["보안"]
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# 업로드 용량 제한 없음: /analyze는 비동기 job이라 처리 시간이 길어져도 HTTP 요청이
-# 걸려 있지 않으므로 게이트웨이 타임아웃 위험이 없다. 대신 파일이 클수록 백그라운드
-# 잡 처리 시간(및 메모리 사용량)이 그만큼 늘어난다.
-
 # Render 프리티어 cold start 방지: 14분마다 자기 자신에게 핑
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
