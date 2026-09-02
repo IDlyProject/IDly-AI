@@ -910,7 +910,6 @@ def build_account_summary(
             {
                 "subject": row.get("subject", ""),
                 "date": row.get("date", ""),
-                "body": row.get("body", ""),
                 "matched_keywords": row.get("matched_keywords", ""),
             }
         )
