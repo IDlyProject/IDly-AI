@@ -10,7 +10,7 @@ import httpx
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 
 from .db import BASE_DIR, Base, SessionLocal, engine
-from .models import Job, JobStatus
+from .models import AnalysisJob, JobStatus
 from .schemas import JobCreatedResponse, JobStatusResponse
 from .service import create_job, get_job, run_job
 
@@ -57,7 +57,7 @@ async def startup_event() -> None:
     # 인메모리 태스크가 사라졌으므로 영구 미완료 상태를 방지한다.
     db = SessionLocal()
     try:
-        stuck = db.query(Job).filter(Job.status == JobStatus.running.value).all()
+        stuck = db.query(AnalysisJob).filter(AnalysisJob.status == JobStatus.running.value).all()
         for job in stuck:
             job.status = JobStatus.failed.value
             job.error_message = "Server restarted while job was running"
