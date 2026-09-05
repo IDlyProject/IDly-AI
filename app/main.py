@@ -26,12 +26,24 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 _INTERNAL_SECRET = os.getenv("INTERNAL_SECRET", "")
+_IS_RENDER = bool(os.getenv("RENDER"))  # Render 플랫폼은 RENDER=true 환경변수를 자동 주입한다
+
+if not _INTERNAL_SECRET:
+    if _IS_RENDER:
+        import sys
+        logger.error(
+            "INTERNAL_SECRET 환경변수가 설정되지 않았습니다. "
+            "Render 환경에서는 필수입니다. 서버를 시작할 수 없습니다."
+        )
+        sys.exit(1)
+    else:
+        logger.warning("INTERNAL_SECRET 미설정 — 개발 모드: /analyze 인증 비활성화")
 
 
 def verify_internal_secret(x_internal_secret: str = Header(default="")) -> None:
     """IDly-Back 전용 내부 인증. INTERNAL_SECRET 환경변수가 설정된 경우에만 검증한다."""
     if not _INTERNAL_SECRET:
-        return  # 환경변수 미설정 시 개발 편의를 위해 통과
+        return  # 로컬 개발 편의 (Render에서는 위에서 이미 exit)
     if x_internal_secret != _INTERNAL_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
